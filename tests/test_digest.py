@@ -92,10 +92,20 @@ class TestLookback(unittest.TestCase):
 
 
 class TestFilingIdentity(unittest.TestCase):
-    def test_link_gives_a_stable_id(self):
-        a = {"link": "https://example.gov/a.pdf", "name": "X"}
-        b = {"link": "https://example.gov/a.pdf", "name": "Y different"}
-        self.assertEqual(m.filing_id(a), m.filing_id(b))
+    def test_same_pdf_different_trades_get_different_ids(self):
+        # Regression: one PTR PDF holds many transactions. Keying the id on the
+        # link alone collapses a whole filing into one id, and dedupe then drops
+        # every trade but the first.
+        base = {"link": "https://example.gov/a.pdf", "chamber": "House", "name": "X",
+                "type": "Purchase", "amount": "$1,001 - $15,000",
+                "transaction_date": "2026-08-01", "disclosure_date": "2026-08-20"}
+        a = dict(base, symbol="BE")
+        b = dict(base, symbol="INTC")
+        self.assertNotEqual(m.filing_id(a), m.filing_id(b))
+
+    def test_identical_trades_are_stable_across_runs(self):
+        item = {"link": "https://example.gov/a.pdf", "symbol": "BE", "name": "X"}
+        self.assertEqual(m.filing_id(item), m.filing_id(dict(item)))
 
     def test_distinct_trades_get_distinct_ids(self):
         base = {"chamber": "House", "name": "A", "symbol": "NVDA", "type": "Purchase",
@@ -104,6 +114,68 @@ class TestFilingIdentity(unittest.TestCase):
         other = dict(base, symbol="AAPL")
         self.assertNotEqual(m.filing_id(base), m.filing_id(other))
         self.assertEqual(m.filing_id(base), m.filing_id(dict(base)))
+
+
+# Text as pypdf actually extracts it from a Clerk PTR, including the NUL bytes
+# the Clerk's font mapping produces where "FILING STATUS:" should be.
+PTR_FIXTURE = (
+    "ID Owner Asset Transaction\nType\nDate Notification\nDate\nAmount Cap.\n"
+    "Gains >\n$200?\n"
+    "Applied Materials, Inc. - Common\nStock (AMAT) [ST]\n"
+    "P 07/13/2026 07/31/2026 $1,001 - $15,000\n"
+    "F\x00\x00\x00\x00\x00 S\x00\x00\x00\x00\x00: New\n"
+    "S\x00\x00\x00\x00\x00\x00\x00\x00\x00 O\x00: Morgan Stanley Active Assets (1)\n"
+    "STERIS plc (STE) [ST] S 07/13/2026 07/31/2026 $1,001 - $15,000\n"
+    "F\x00\x00\x00\x00\x00 S\x00\x00\x00\x00\x00: New\n"
+    "W.W. Grainger, Inc. Common Stock\n(GWW) [ST]\n"
+    "S (partial) 07/13/2026 07/31/2026 $50,001 - $100,000\n"
+    "Bloom Energy Corporation Class A Common Stock (BE) [OP]\n"
+    "P 07/28/2026 08/21/2026 $500,001 - $1,000,000\n"
+    "* For the complete list of asset type abbreviations, please visit https://fd.house.gov/\n"
+)
+
+
+class TestPtrPdfParsing(unittest.TestCase):
+    """The Clerk index has no trade detail; it is parsed out of the filing PDF."""
+
+    def setUp(self):
+        self.rows = m.parse_ptr_text(PTR_FIXTURE)
+
+    def test_finds_every_transaction(self):
+        self.assertEqual(len(self.rows), 4)
+
+    def test_transaction_on_its_own_line(self):
+        r = self.rows[0]
+        self.assertEqual(r["symbol"], "AMAT")
+        self.assertEqual(r["type"], "Purchase")
+        self.assertEqual(r["transaction_date"], "2026-07-13")
+        self.assertEqual(r["amount"], "$1,001 - $15,000")
+        self.assertEqual(r["asset"], "Applied Materials, Inc. - Common Stock (AMAT)")
+
+    def test_transaction_sharing_a_line_with_the_asset(self):
+        r = self.rows[1]
+        self.assertEqual(r["symbol"], "STE")
+        self.assertEqual(r["type"], "Sale")
+        self.assertEqual(r["asset"], "STERIS plc (STE)")
+
+    def test_nul_padded_footer_labels_do_not_leak_into_the_next_asset(self):
+        # "FILING STATUS:"/"SUBHOLDING OF:" trail a row; without stripping the
+        # NUL bytes they get absorbed into the following asset name.
+        for r in self.rows:
+            self.assertNotIn("Morgan Stanley", r["asset"])
+            self.assertNotIn(":", r["asset"])
+
+    def test_partial_sale_qualifier(self):
+        self.assertEqual(self.rows[2]["type"], "Sale (partial)")
+        self.assertEqual(self.rows[2]["amount_mid"], 75000.5)
+
+    def test_asset_type_code_becomes_a_label(self):
+        self.assertEqual(self.rows[3]["asset_kind"], "options")
+        self.assertNotIn("[OP]", self.rows[3]["asset"])
+        self.assertEqual(self.rows[0]["asset_kind"], "")   # plain stock: no label
+
+    def test_scanned_pdf_yields_nothing_rather_than_garbage(self):
+        self.assertEqual(m.parse_ptr_text(""), [])
 
 
 class TestRenderingSafety(unittest.TestCase):
@@ -212,7 +284,7 @@ class TestSubject(unittest.TestCase):
     def test_mentions_count_and_top_tickers(self):
         items = [{"symbol": "NVDA"}, {"symbol": "NVDA"}, {"symbol": "AAPL"}]
         subject = m.build_subject(items)
-        self.assertIn("3 new filing(s)", subject)
+        self.assertIn("3 new trade(s)", subject)
         self.assertIn("NVDA", subject)
 
     def test_empty(self):

@@ -42,7 +42,7 @@ The three failures that produce an identical "exit code 1" in the old version:
 | Symptom in `--doctor` | Cause | Fix |
 |---|---|---|
 | `FMP /house-latest HTTP 401` | Key wrong, or has stray whitespace/quotes | Re-paste the `FMP_API_KEY` secret |
-| `FMP /house-latest HTTP 403` / "Exclusive Endpoint" | Congressional data is not on your FMP plan | Nothing to fix — the digest falls back to the free House Clerk feed automatically |
+| `FMP /house-latest HTTP 402/403` / "Exclusive Endpoint" | Congressional data is not on your FMP plan | Nothing to fix — the digest falls back to the Clerk and parses the filing PDFs for the same detail. You only lose the Senate. |
 | `Resend ... testing emails` | Unverified sender can only deliver to your own Resend account address | Set `RECIPIENT_EMAIL` to that address, or verify a domain and set `FROM_EMAIL` |
 
 ---
@@ -52,14 +52,16 @@ The three failures that produce an identical "exit code 1" in the old version:
 1. **Primary source — [Financial Modeling Prep](https://site.financialmodelingprep.com)** (`house-latest`, `senate-latest`).
    Rich data: ticker, transaction type, amount bracket, trade date, filing date.
    Requires an API key, and congressional data is plan-gated on some FMP tiers.
-2. **Fallback — the [U.S. House Clerk](https://disclosures-clerk.house.gov) disclosure index.**
-   Free, no key, authoritative. Thinner: it tells you *who* filed and *when* plus
-   a link to the filing PDF, but not the individual trades — those exist only
-   inside the PDF, often as a scan.
+2. **Fallback — the [U.S. House Clerk](https://disclosures-clerk.house.gov).**
+   Free, no key, authoritative. The Clerk's index carries only *who* filed and
+   *when*, so the digest downloads each filing's PDF and parses the individual
+   trades out of it: ticker, asset, purchase/sale, trade date, amount bracket.
+   Roughly 90% of filings are electronic and parse cleanly; the remainder are
+   scanned images, and those keep a filing-level row linking to the PDF.
 
-If FMP fails for any reason, the run logs exactly why and falls back to the Clerk
-feed. **A bad key or a plan change degrades the digest instead of killing it.**
-The email carries a banner explaining what is missing, and columns that would be
+If FMP fails for any reason, the run logs exactly why and falls back to the
+Clerk. **A bad key or a plan change costs you Senate coverage, not the digest.**
+The email carries a banner saying which source it used, and columns that would be
 entirely empty are dropped rather than rendered as a wall of em-dashes.
 
 Then it filters to the last `LOOKBACK_DAYS`, drops anything already emailed,
@@ -92,7 +94,7 @@ sorts by estimated size, and sends via [Resend](https://resend.com).
 
 Tuning knobs go under the **Variables** tab (not Secrets), all optional:
 `LOOKBACK_DAYS` (3), `INCLUDE_SENATE` (true), `MIN_AMOUNT` (0),
-`SEND_WHEN_EMPTY` (false).
+`SEND_WHEN_EMPTY` (false), `ENRICH_PDFS` (true), `MAX_PDFS` (60).
 
 ### 3. Test before waiting for 7 AM
 
@@ -151,11 +153,12 @@ If `state/seen.json` has never been committed, the script falls back to a strict
 
 ## Known limitations
 
-- **The Clerk fallback has no per-trade detail.** The index lists filings, not
-  transactions. Extracting tickers and amounts means parsing the PDFs, many of
-  which are scans requiring OCR. Deliberately out of scope.
-- **Senate data comes only from FMP.** The Senate's own disclosure portal has no
-  comparable bulk feed, so `INCLUDE_SENATE` is effectively FMP-only.
+- **Scanned filings carry no trade detail.** Around one filing in ten is a
+  scanned image rather than an electronic submission, so there is no text to
+  parse. Those rows still appear, with a link to the PDF. Reading them would
+  need OCR, which is out of scope.
+- **Senate data comes only from FMP.** The Senate's own portal has no comparable
+  bulk feed, so without a working FMP key the digest is House-only.
 - **FMP field names are best-effort.** They are not fully documented and vary by
   plan; `normalize_fmp()` checks the plausible variants. Use `debug` mode if a column
   looks blank.
@@ -167,4 +170,4 @@ If `state/seen.json` has never been committed, the script falls back to a strict
 
 - Filter to a watchlist of tickers or members.
 - Cross-reference tickers against pre-market movers for a 7 AM read.
-- OCR the Clerk PDFs so the fallback carries real trade detail too.
+- OCR the ~10% of filings that are scanned images.

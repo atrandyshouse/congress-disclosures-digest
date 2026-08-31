@@ -41,6 +41,7 @@ import re
 import sys
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -138,6 +139,13 @@ INCLUDE_SENATE = env_bool("INCLUDE_SENATE", True)
 MIN_AMOUNT = env_int("MIN_AMOUNT", 0)
 HIGHLIGHT_AMOUNT = env_int("HIGHLIGHT_AMOUNT", 50_000)
 SEND_WHEN_EMPTY = env_bool("SEND_WHEN_EMPTY", False)
+
+# When falling back to the House Clerk, download each filing's PDF and parse the
+# individual trades out of it. This is what recovers ticker/type/amount, which
+# the Clerk's index file does not carry. Costs one HTTP request per filing, so
+# it only runs on filings already inside the lookback window.
+ENRICH_PDFS = env_bool("ENRICH_PDFS", True)
+MAX_PDFS = env_int("MAX_PDFS", 60)
 
 SEND_HOUR_CT = env_int("SEND_HOUR_CT", 7)
 # How many hours past SEND_HOUR_CT a late run is still allowed to send.
@@ -273,8 +281,13 @@ def _fmp_error(resp: requests.Response, endpoint: str) -> SourceError:
                 "paid add-on on some FMP tiers. The digest will fall back to the free House Clerk feed.")
     elif resp.status_code == 429:
         hint = "FMP rate limit hit (the free tier is a few hundred calls/day)."
+    elif resp.status_code == 402:
+        hint = (f"HTTP 402 Payment Required -- /{endpoint} is not included in your FMP plan. "
+                "The digest falls back to the free House Clerk feed, which now parses trade "
+                "detail out of the filing PDFs, so you lose little beyond Senate coverage.")
     else:
-        hint = "Unexpected FMP response."
+        hint = (f"Unexpected FMP response (HTTP {resp.status_code}). The full body is in the "
+                "workflow log; run the workflow in `debug` mode for the raw records.")
     return SourceError(f"FMP /{endpoint} returned HTTP {resp.status_code}: {body}", hint)
 
 
@@ -453,6 +466,134 @@ def fetch_clerk(years: list[int]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Source 2b: parsing the trades out of a filing PDF
+# --------------------------------------------------------------------------
+
+# A transaction row: type code, trade date, notification date, amount bracket.
+# The type may sit on its own line or share a line with the asset name, so this
+# is deliberately not anchored to the start of a line.
+PTR_TXN_RE = re.compile(
+    r"\b(?P<type>P|S|E)(?P<qual>\s*\((?:partial|full)\))?\s+"
+    r"(?P<txn>\d{2}/\d{2}/\d{4})\s+(?P<notif>\d{2}/\d{2}/\d{4})\s+"
+    r"(?P<amount>\$[\d,]+(?:\s*-\s*\$[\d,]+)?)"
+)
+# "FILING STATUS:", "SUBHOLDING OF:", "DESCRIPTION:", "LOCATION:" -- these trail
+# a transaction row and would otherwise be absorbed into the NEXT asset name.
+PTR_FOOTER_RE = re.compile(r"^\s*[A-Z](?:\s+[A-Z])*\s*:.*$")
+PTR_OWNER_RE = re.compile(r"^(SP|JT|DC)\b\s*")
+PTR_TICKER_RE = re.compile(r"\(([A-Z][A-Z.\-]{0,5})\)\s*\[")
+PTR_TYPES = {"P": "Purchase", "S": "Sale", "E": "Exchange"}
+# Asset-type codes the Clerk appends in brackets. Full list:
+# https://fd.house.gov/reference/asset-type-codes.aspx
+PTR_ASSET_KINDS = {
+    "ST": "", "OP": "options", "CS": "corporate bond", "GS": "govt bond",
+    "MF": "mutual fund", "EF": "ETF", "AB": "asset-backed", "RP": "real property",
+    "HN": "hedge fund", "PE": "private equity", "OL": "ordinary shares",
+    "OI": "other income", "OT": "other", "BA": "bank account", "FA": "farm",
+}
+
+
+def _ptr_clean_asset(span: str) -> str:
+    kept = [ln for ln in span.splitlines() if not PTR_FOOTER_RE.match(ln)]
+    text = re.sub(r"\s+", " ", " ".join(kept)).strip()
+    text = re.sub(r".*Cap\.?\s*Gains\s*>?\s*\$?200\?", "", text).strip()
+    text = re.sub(r"^\(\d+\)\s*", "", text)
+    return PTR_OWNER_RE.sub("", text).strip(" -")
+
+
+def parse_ptr_text(text: str) -> list[dict]:
+    """Pull individual transactions out of a PTR PDF's extracted text."""
+    # The Clerk's PDFs emit NUL bytes wherever the font mapping fails, so the
+    # label "FILING STATUS:" extracts as "F\x00\x00\x00\x00\x00 S\x00...".
+    # Strip them first or the footer filter above never matches anything.
+    body = text.replace("\x00", "")
+    for marker in ("* For the complete list of asset type", "I CERTIFY that the statements"):
+        idx = body.find(marker)
+        if idx > 0:
+            body = body[:idx]
+
+    rows, cursor = [], 0
+    for m in PTR_TXN_RE.finditer(body):
+        asset = _ptr_clean_asset(body[cursor:m.start()])
+        cursor = m.end()
+        ticker = PTR_TICKER_RE.search(asset)
+        kind = re.search(r"\[([A-Z]{2})\]\s*$", asset)
+        if kind:
+            asset = asset[:kind.start()].strip()
+        qual = m.group("qual") or ""
+        amount = re.sub(r"\s*-\s*", " - ", m.group("amount"))
+        rows.append({
+            "asset": asset[:110],
+            "asset_kind": PTR_ASSET_KINDS.get(kind.group(1), kind.group(1)) if kind else "",
+            "symbol": ticker.group(1) if ticker else "",
+            "type": PTR_TYPES.get(m.group("type"), m.group("type"))
+                    + (" (partial)" if "partial" in qual else ""),
+            "transaction_date": normalize_date(m.group("txn")),
+            "amount": amount,
+            "amount_mid": parse_amount_midpoint(amount),
+        })
+    return rows
+
+
+def enrich_from_pdfs(items: list[dict]) -> tuple[list[dict], list[str]]:
+    """Expand each House Clerk filing into its individual transactions.
+
+    The Clerk's index says only who filed and when; the trades live in the PDF.
+    Most are electronically filed and carry a text layer, so they parse cleanly.
+    A minority are scans with no text -- those keep their filing-level row, which
+    at least still links to the document.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return items, ["PDF detail unavailable: pypdf is not installed."]
+
+    targets = [i for i in items if i.get("source") == "House Clerk" and i.get("link")]
+    if not targets:
+        return items, []
+    if len(targets) > MAX_PDFS:
+        log(f"Capping PDF enrichment at {MAX_PDFS} of {len(targets)} filing(s).")
+        targets = targets[:MAX_PDFS]
+
+    def fetch_one(item: dict):
+        try:
+            resp = SESSION.get(item["link"], timeout=45)
+            if resp.status_code >= 300:
+                return item, []
+            reader = PdfReader(io.BytesIO(resp.content))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            return item, parse_ptr_text(text)
+        except Exception as exc:  # a malformed PDF must not kill the digest
+            log(f"  PDF parse failed for {item.get('name')}: {type(exc).__name__}: {exc}")
+            return item, []
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(fetch_one, targets))
+
+    enriched, scanned = [], 0
+    for item, trades in results:
+        if not trades:
+            scanned += 1
+            enriched.append(item)   # keep the filing-level row + its PDF link
+            continue
+        for trade in trades:
+            enriched.append({**item, **trade, "source": "House Clerk (PDF)"})
+
+    # Anything not eligible for enrichment passes through untouched.
+    handled = {id(i) for i, _ in results}
+    enriched.extend(i for i in items if id(i) not in handled)
+
+    notes = []
+    trades_found = sum(1 for i in enriched if i.get("symbol") or i.get("amount"))
+    log(f"PDF enrichment: {len(targets)} filing(s) -> {trades_found} transaction(s); "
+        f"{scanned} had no readable text layer.")
+    if scanned:
+        notes.append(f"{scanned} filing(s) are scanned images with no text layer; "
+                     f"those rows link to the PDF but carry no trade detail.")
+    return enriched, notes
+
+
+# --------------------------------------------------------------------------
 # Filtering
 # --------------------------------------------------------------------------
 
@@ -462,12 +603,12 @@ def filing_id(item: dict) -> str:
 
     Prefer the filing link (which embeds the Clerk document ID); otherwise
     hash the fields that together identify a single disclosed transaction."""
-    if item.get("link"):
-        basis = item["link"]
-    else:
-        basis = "|".join(str(item.get(k, "")) for k in
-                         ("chamber", "name", "symbol", "type", "amount",
-                          "transaction_date", "disclosure_date"))
+    # The link alone is NOT enough: one PTR PDF holds many transactions, so
+    # keying on it would collapse a whole filing into a single id and dedupe
+    # would silently drop every trade but the first.
+    basis = "|".join(str(item.get(k, "")) for k in
+                     ("link", "chamber", "name", "symbol", "type", "amount",
+                      "transaction_date", "disclosure_date"))
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
 
@@ -525,7 +666,7 @@ def build_subject(items: list[dict]) -> str:
     tickers = [i["symbol"] for i in items if i.get("symbol")]
     top = ", ".join(t for t, _ in Counter(tickers).most_common(3))
     lead = f" — {top}" if top else ""
-    return f"Congressional Trading Digest — {today_str} — {len(items)} new filing(s){lead}"
+    return f"Congressional Trading Digest — {today_str} — {len(items)} new trade(s){lead}"
 
 
 def build_email_html(items: list[dict], lookback_days: int, notes: list[str]) -> str:
@@ -573,7 +714,7 @@ def build_email_html(items: list[dict], lookback_days: int, notes: list[str]) ->
                 f"<div style='font-size:18px;font-weight:600;color:#111;'>{esc(value)}</div></td>")
 
     stats = "".join([
-        stat("Filings", str(len(items))),
+        stat("Trades", str(len(items))),
         stat("Members", str(members)),
         stat("Buys", str(buys)) if buys else "",
         stat("Sells", str(sells)) if sells else "",
@@ -597,6 +738,13 @@ def build_email_html(items: list[dict], lookback_days: int, notes: list[str]) ->
         sub_html = f"<div style='color:#888;font-size:11px;'>{esc(sub)}</div>" if sub else ""
         return f"{esc(it['name'])}{sub_html}"
 
+    def asset_cell(it: dict) -> str:
+        kind = esc(it.get("asset_kind"))
+        tag = (f"<span style='display:inline-block;margin-left:6px;padding:1px 5px;"
+               f"background:#eef2f7;border-radius:3px;font-size:10px;color:#555;"
+               f"text-transform:uppercase;'>{kind}</span>") if kind else ""
+        return f"<span style='display:inline-block;min-width:190px;'>{esc(it.get('asset'))}{tag}</span>"
+
     def type_cell(it: dict) -> str:
         text = esc(it.get("type")) or "—"
         if is_purchase(it):
@@ -619,7 +767,7 @@ def build_email_html(items: list[dict], lookback_days: int, notes: list[str]) ->
     columns = [
         ("Member", member_cell, lambda it: True),
         ("Ticker", plain("symbol", "font-weight:600;"), lambda it: bool(it.get("symbol"))),
-        ("Asset", plain("asset"), lambda it: bool(it.get("asset"))),
+        ("Asset", asset_cell, lambda it: bool(it.get("asset"))),
         ("Type", type_cell, lambda it: bool(it.get("type"))),
         ("Amount", plain("amount"), lambda it: bool(it.get("amount"))),
         ("Traded", plain("transaction_date"), lambda it: bool(it.get("transaction_date"))),
@@ -712,7 +860,7 @@ def gather(debug: bool = False) -> tuple[list[dict], list[str]]:
                 log(f"FMP {chamber} failed: {exc}")
                 if exc.hint:
                     log(f"  -> {exc.hint}")
-                notes.append(f"{chamber} data via FMP unavailable: {exc.hint or exc}")
+                notes.append(f"{chamber} data via FMP unavailable — {exc.hint or exc}")
             except requests.RequestException as exc:
                 # Connection/DNS/TLS failure rather than an HTTP status. Treat it
                 # the same way, so a network blip still falls back to the Clerk
@@ -945,6 +1093,16 @@ def main(argv: list[str] | None = None) -> int:
 
     recent = [i for i in items if within_lookback(i, LOOKBACK_DAYS)]
     log(f"{len(recent)} of {len(items)} item(s) fall inside the {LOOKBACK_DAYS}-day lookback.")
+
+    # Only worth doing once the list is small -- it is one HTTP request per filing.
+    if ENRICH_PDFS and any(i.get("source") == "House Clerk" for i in recent):
+        recent, pdf_notes = enrich_from_pdfs(recent)
+        # These notes described the un-enriched Clerk index and are now false.
+        stale = ("no ticker/amount detail", "no per-trade detail")
+        notes = [n for n in notes if not any(m in n for m in stale)]
+        notes.append("House trade detail parsed directly from the Clerk's filing PDFs "
+                     "(the official source), not from FMP.")
+        notes.extend(pdf_notes)
 
     if MIN_AMOUNT > 0:
         before = len(recent)
