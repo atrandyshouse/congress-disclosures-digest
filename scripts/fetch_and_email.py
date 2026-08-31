@@ -751,29 +751,49 @@ def cmd_doctor() -> int:
     exit code 1, which cannot distinguish 'bad FMP key' from 'plan does not
     include this endpoint' from 'Resend refused the recipient'.
     """
+    in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    secrets_url = (f"https://github.com/{repo}/settings/secrets/actions"
+                   if repo else "Settings -> Secrets and variables -> Actions")
+
     print("=" * 68)
     print("  Congressional Trading Digest -- configuration check")
     print("=" * 68)
     failures = 0
+    remedies: list[str] = []
 
-    def check(label: str, ok: bool, detail: str = "", optional: bool = False) -> None:
+    def check(label: str, ok: bool, detail: str = "", optional: bool = False,
+              fix: str = "") -> None:
         nonlocal failures
         mark = "PASS" if ok else ("WARN" if optional else "FAIL")
         print(f"[{mark}] {label}")
         if detail:
             for line in detail.splitlines():
                 print(f"       {line}")
-        if not ok and not optional:
-            failures += 1
+        if ok:
+            return
+        if fix:
+            remedies.append(fix)
+        if optional:
+            # Surfaces in the Actions UI without failing the job.
+            if in_actions:
+                print(f"::warning title={label}::{detail.splitlines()[0] if detail else 'check failed'}")
+            return
+        failures += 1
+        if in_actions:
+            print(f"::error title={label}::{detail.splitlines()[0] if detail else 'check failed'}")
 
     # 1. Environment
     def mask(v: str) -> str:
         return f"set ({len(v)} chars, {v[:4]}...{v[-2:]})" if len(v) > 6 else ("set (short!)" if v else "MISSING")
 
     check("FMP_API_KEY", bool(FMP_API_KEY), mask(FMP_API_KEY) + ("" if FMP_API_KEY else
-          "\nOptional -- without it the digest falls back to the House Clerk feed."), optional=True)
-    check("RESEND_API_KEY", bool(RESEND_API_KEY), mask(RESEND_API_KEY))
-    check("RECIPIENT_EMAIL", bool(RECIPIENT_EMAIL), RECIPIENT_EMAIL or "MISSING")
+          "\nOptional -- without it the digest falls back to the House Clerk feed."), optional=True,
+          fix=f"Optional: add the repository secret FMP_API_KEY for ticker/amount detail  ({secrets_url})")
+    check("RESEND_API_KEY", bool(RESEND_API_KEY), mask(RESEND_API_KEY),
+          fix=f"Add the repository secret RESEND_API_KEY  ({secrets_url})")
+    check("RECIPIENT_EMAIL", bool(RECIPIENT_EMAIL), RECIPIENT_EMAIL or "MISSING",
+          fix=f"Add the repository secret RECIPIENT_EMAIL  ({secrets_url})")
     check("FROM_EMAIL", bool(FROM_EMAIL), FROM_EMAIL)
 
     # 2. Timezone data
@@ -854,7 +874,34 @@ def cmd_doctor() -> int:
     print(f"[INFO] Send decision right now: {'SEND' if ok else 'SKIP'} -- {reason}")
 
     print("-" * 68)
-    print(f"{failures} check(s) failed." if failures else "All checks passed.")
+    if remedies:
+        print("WHAT TO DO NEXT")
+        for i, remedy in enumerate(remedies, 1):
+            print(f"  {i}. {remedy}")
+        if not (RESEND_API_KEY and RECIPIENT_EMAIL):
+            print()
+            print("  If you believe you already added these: repository secrets are")
+            print("  per-repository and are NOT inherited from another repo, an")
+            print("  organisation without access granted, or a fork. Environment")
+            print("  secrets also need `environment:` declared on the job, which this")
+            print("  workflow does not use -- add them as *repository* secrets.")
+        print("-" * 68)
+    print(f"{failures} required check(s) failed." if failures else "All required checks passed.")
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write("## Digest configuration check\n\n")
+                fh.write(f"**{failures} required check(s) failed.**\n\n" if failures
+                         else "**All required checks passed.**\n\n")
+                if remedies:
+                    fh.write("### What to do next\n\n")
+                    for remedy in remedies:
+                        fh.write(f"- {remedy}\n")
+        except OSError:
+            pass
+
     return 1 if failures else 0
 
 
