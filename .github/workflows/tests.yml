@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Pure logic only -- no network, no credentials, so this is safe to run
+      # on every push including from forks.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Import and CLI smoke test
+        run: python scripts/fetch_and_email.py --help
